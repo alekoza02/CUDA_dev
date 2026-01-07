@@ -14,61 +14,57 @@
   } \
 } while(0)
 
-// kernels
 
+// Hard cap limit: sizeof(kernel) < 64KB
+// Formula: KCH * KCW * 4 < 64'000'000
+#define KCH 100
+#define KCW 100
+
+__constant__ float c_ker[KCH * KCW];
+
+// KERNEL
 extern "C" __global__
-void erosion(
-    float* img, float* ker, float* out,
-    int img_H, int img_W, 
-    int ker_H, int ker_W,
-    int out_H, int out_W)
+void erosion_chunked(
+    float* img,
+    float* out,
+    int img_H, int img_W,
+    int out_H, int out_W,
+    int ky_off, int kx_off)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (idx >= out_W || idy >= out_H) return;
+    if (x >= out_W || y >= out_H) return;
 
-    float min_val = FLT_MAX;
+    int out_idx = y * out_W + x;
+    float acc = out[out_idx];
 
-    for (int ki = 0; ki < ker_H; ++ki) {
-        
-        int img_row_offset = (idy + ki) * img_W;
-        int ker_row_offset = ki * ker_W;
+    for (int ky = 0; ky < KCH; ++ky) {
+        int img_y = y + ky + ky_off;
+        int img_row = img_y * img_W;
 
-        for (int kj = 0; kj < ker_W; ++kj) {
-            
-            float pixel = img[img_row_offset + (idx + kj)];
-            float k_val = ker[ker_row_offset + kj];
+        int ker_row = ky * KCW;
 
-            min_val = fminf(min_val, pixel - k_val);
+        for (int kx = 0; kx < KCW; ++kx) {
+            float pixel = img[img_row + x + kx + kx_off];
+            float kval  = c_ker[ker_row + kx];
+            acc = fminf(acc, pixel - kval);
         }
     }
 
-    out[idy * out_W + idx] = min_val;
+    out[out_idx] = acc;
 }
 
-
-/*
-For dilation replace the following lines in the erosion code:
-    float max_val = -FLT_MAX;
-    max_val = fmaxf(max_val, pixel + k_val);
-    out[idy * out_W + idx] = max_val;
-*/
-
-
-
-// utility
-
+// UTILITY
 static inline float frand() {
     return (float)rand() / (float)RAND_MAX;
 }
 
-
+// MAIN
 int main() {
 
     srand((unsigned)time(nullptr));
 
-    // dimensions
     const int img_H = 1024;
     const int img_W = 1024;
     const int ker_H = 200;
@@ -80,61 +76,73 @@ int main() {
     const size_t ker_bytes = ker_H * ker_W * sizeof(float);
     const size_t out_bytes = out_H * out_W * sizeof(float);
 
-    // host allocations
+    // Host memory
     float* h_img = (float*)malloc(img_bytes);
     float* h_ker = (float*)malloc(ker_bytes);
-    float* h_out_erosion = (float*)malloc(out_bytes);
+    float* h_out = (float*)malloc(out_bytes);
 
-    // fill with random data
     for (int i = 0; i < img_H * img_W; ++i)
         h_img[i] = frand();
 
     for (int i = 0; i < ker_H * ker_W; ++i)
         h_ker[i] = frand();
 
-    // device allocations
-    float *d_img, *d_ker, *d_out;
-    cudaMalloc(&d_img, img_bytes);
-    cudaMalloc(&d_ker, ker_bytes);
-    cudaMalloc(&d_out, out_bytes);
+    for (int i = 0; i < out_H * out_W; ++i)
+        h_out[i] = FLT_MAX;
 
-    cudaMemcpy(d_img, h_img, img_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ker, h_ker, ker_bytes, cudaMemcpyHostToDevice);
+    // Device memory
+    float *d_img, *d_out;
+    CHECK(cudaMalloc(&d_img, img_bytes));
+    CHECK(cudaMalloc(&d_out, out_bytes));
 
-    // launch configuration
+    CHECK(cudaMemcpy(d_img, h_img, img_bytes, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_out, h_out, out_bytes, cudaMemcpyHostToDevice));
+
     dim3 block(16, 16);
     dim3 grid((out_W + block.x - 1) / block.x,
               (out_H + block.y - 1) / block.y);
-              
-    // erosion
+
     auto start = std::chrono::high_resolution_clock::now();
-    CHECK(cudaMalloc(&d_img, img_bytes));
-    CHECK(cudaMemcpy(d_img, h_img, img_bytes, cudaMemcpyHostToDevice));
-    erosion<<<grid, block>>>(
-        d_img, d_ker, d_out,
-        img_H, img_W,
-        ker_H, ker_W,
-        out_H, out_W
-    );
-    CHECK(cudaGetLastError());
+
+    int n_chunk_x = (ker_W + KCW - 1) / KCW;
+    int n_chunk_y = (ker_H + KCH - 1) / KCH;
+    
+    for (int ky = 0; ky < n_chunk_y; ++ky) {
+        for (int kx = 0; kx < n_chunk_x; ++kx) {
+
+            // copy kernel chunk into constant memory
+            float h_chunk[KCH * KCW];
+
+            for (int i = 0; i < KCH; ++i)
+                for (int j = 0; j < KCW; ++j)
+                    h_chunk[i * KCW + j] = h_ker[(ky * KCH + i) * ker_W + (kx * KCW + j)];
+
+            CHECK(cudaMemcpyToSymbol(c_ker, h_chunk, sizeof(h_chunk)));
+
+            erosion_chunked<<<grid, block>>>(
+                d_img, d_out,
+                img_H, img_W,
+                out_H, out_W,
+                ky * KCH, kx * KCW
+            );
+
+            CHECK(cudaGetLastError());
+        }
+    }
+
     CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
-    cudaMemcpy(h_out_erosion, d_out, out_bytes, cudaMemcpyDeviceToHost);
+    CHECK(cudaMemcpy(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost));
 
-    cudaDeviceSynchronize();
+    std::cout << "Done in " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms\n";
 
-    // cleanup
     cudaFree(d_img);
-    cudaFree(d_ker);
     cudaFree(d_out);
 
     free(h_img);
     free(h_ker);
-    free(h_out_erosion);
-    
-    auto duration_us = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    std::cout << "Done in " << duration_us.count() << " ms.\n";
+    free(h_out);
 
     return 0;
 }
