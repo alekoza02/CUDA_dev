@@ -6,6 +6,8 @@
 #include <chrono>
 #include <iostream>
 
+#include "config.h"
+
 #define CHECK(x) do { \
   cudaError_t err = x; \
   if (err != cudaSuccess) { \
@@ -13,12 +15,6 @@
     exit(1); \
   } \
 } while(0)
-
-
-// Hard cap limit: sizeof(kernel) < 64KB
-// Formula: KCH * KCW * 4 < 64'000'000
-#define KCH 100
-#define KCW 100
 
 __constant__ float c_ker[KCH * KCW];
 
@@ -98,7 +94,7 @@ int main() {
     CHECK(cudaMemcpy(d_img, h_img, img_bytes, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_out, h_out, out_bytes, cudaMemcpyHostToDevice));
 
-    dim3 block(16, 16);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((out_W + block.x - 1) / block.x,
               (out_H + block.y - 1) / block.y);
 
